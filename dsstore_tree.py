@@ -297,8 +297,7 @@ class Scanner:
             print(f"[ERROR] Unexpected error: {e}")
             sys.exit(1)
 
-
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
         description=rf"  dsstore-tree is a tool to discover files and directories through .DS_Store exposure.",
         formatter_class=RawTextHelpFormatter
@@ -325,3 +324,6 @@ if __name__ == "__main__":
 
     s = Scanner(args.url, args.download, args.quiet)
     s.scan()
+
+if __name__ == "__main__":
+    main()

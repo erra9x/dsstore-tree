@@ -30,6 +30,14 @@ optional arguments:
 
 # Installation
 
+Install via `pipx`:
+
+```
+pipx install git+https://github.com/vflame6/dsstore-tree.git
+```
+
+Manual installation:
+
 ```shell
 git clone https://github.com/vflame6/dsstore-tree.git
 cd dsstore-tree
