@@ -176,3 +176,5 @@ cython_debug/
 .idea/
 testing/
 .DS_Store
+
+.venv/
