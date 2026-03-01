@@ -1,10 +1,20 @@
+#!/usr/bin/env python3
+"""dsstore-tree — Discover files and directories via exposed .DS_Store files."""
+
+from __future__ import annotations
+
 import argparse
-import tempfile
+import json
 import os
-import requests
 import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Optional
 from urllib.parse import urljoin, urlparse
-from argparse import RawTextHelpFormatter
+
+import requests
+import urllib3
 
 try:
     from ds_store import DSStore
@@ -12,318 +22,347 @@ except ImportError:
     print("[ERROR] ds-store library not found. Install it with: pip install ds-store")
     sys.exit(1)
 
-BANNER = r"""       __          __                        __               
-  ____/ /_________/ /_____  ________        / /_________  ___ 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+BANNER = r"""       __          __                        __
+  ____/ /_________/ /_____  ________        / /_________  ___
  / __  / ___/ ___/ __/ __ \/ ___/ _ \______/ __/ ___/ _ \/ _ \
 / /_/ (__  |__  ) /_/ /_/ / /  /  __/_____/ /_/ /  /  __/  __/
 \__,_/____/____/\__/\____/_/   \___/      \__/_/   \___/\___/
 """
 
+# ANSI colors
+COLOR_DIR = "\033[1;34m"   # bold blue
+COLOR_FILE = "\033[0;32m"  # green
+COLOR_DL = "\033[0;36m"    # cyan
+COLOR_ERR = "\033[0;31m"   # red
+COLOR_INFO = "\033[0;33m"  # yellow
+COLOR_RESET = "\033[0m"
+
+
+def _c(color: str, text: str, use_color: bool) -> str:
+    return f"{color}{text}{COLOR_RESET}" if use_color else text
+
+
+@dataclass
+class Entry:
+    """A discovered file or directory."""
+    path: str
+    is_dir: bool
+    url: str
+    downloaded: bool = False
+
+
+@dataclass
+class ScanResult:
+    """Aggregated scan results."""
+    base_url: str
+    entries: list[Entry] = field(default_factory=list)
+
+    @property
+    def dirs(self) -> list[Entry]:
+        return [e for e in self.entries if e.is_dir]
+
+    @property
+    def files(self) -> list[Entry]:
+        return [e for e in self.entries if not e.is_dir]
+
+    def to_dict(self) -> dict:
+        return {
+            "base_url": self.base_url,
+            "directories": [e.path for e in self.dirs],
+            "files": [{"path": e.path, "url": e.url, "downloaded": e.downloaded} for e in self.files],
+            "summary": {
+                "directories": len(self.dirs),
+                "files": len(self.files),
+            },
+        }
+
 
 class Scanner:
-    def __init__(self, url, download, quiet):
-        self.url = url.rstrip('/')
+    def __init__(
+        self,
+        url: str,
+        *,
+        download: bool = False,
+        quiet: bool = False,
+        color: bool = True,
+        max_depth: int = 0,
+        timeout: int = 10,
+        threads: int = 10,
+        proxy: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
+        json_output: bool = False,
+    ):
+        self.url = url.rstrip("/")
         self.download = download
         self.download_dir = "dsstore-tree_" + urlparse(url).netloc
         self.quiet = quiet
-        self.found_files = []
-        self.found_dirs = []
-        self.scanned_dirs = set()
+        self.color = color and not json_output
+        self.max_depth = max_depth
+        self.timeout = timeout
+        self.threads = threads
+        self.json_output = json_output
+        self.result = ScanResult(base_url=self.url)
+        self.scanned_dirs: set[str] = set()
 
-    def is_valid_name(self, entry_name):
-        """Validate entry name to prevent directory traversal attacks"""
-        if entry_name.find('..') >= 0 or \
-                entry_name.startswith('/') or \
-                entry_name.startswith('\\') or \
-                entry_name in ['.', '..', ''] or \
-                not entry_name:
+        self.session = requests.Session()
+        self.session.verify = False
+        self.session.timeout = timeout
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
+        if headers:
+            self.session.headers.update(headers)
+
+    # -- helpers --
+
+    def _log(self, msg: str) -> None:
+        if not self.quiet and not self.json_output:
+            print(msg)
+
+    @staticmethod
+    def _is_valid_name(name: str) -> bool:
+        if not name or name in (".", ".."):
+            return False
+        if ".." in name or name.startswith(("/", "\\")):
             return False
         return True
 
-    def download_file(self, url, local_path):
-        """Download a file from URL to local path"""
+    def _parse_dsstore(self, content: bytes) -> set[str]:
+        filenames: set[str] = set()
+        tmp_path: Optional[str] = None
         try:
-            r = requests.get(url, stream=True, timeout=10, verify=False)
+            fd, tmp_path = tempfile.mkstemp(suffix=".ds_store")
+            os.write(fd, content)
+            os.close(fd)
+            with DSStore.open(tmp_path, "r+") as d:
+                for entry in d:
+                    if entry.filename and self._is_valid_name(entry.filename):
+                        filenames.add(entry.filename)
+        except Exception as e:
+            self._log(_c(COLOR_ERR, f"[ERROR] Failed to parse .DS_Store: {e}", self.color))
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        return filenames
+
+    def _fetch_dsstore(self, base_url: str) -> Optional[bytes]:
+        """Fetch .DS_Store from a URL, return content or None."""
+        dsstore_url = base_url.rstrip("/") + "/.DS_Store"
+        try:
+            r = self.session.get(dsstore_url, timeout=self.timeout)
+            if r.status_code == 200 and len(r.content) > 0:
+                return r.content
+        except Exception:
+            pass
+        return None
+
+    def _is_accessible_file(self, url: str) -> bool:
+        """Check if URL points to an accessible file (not a directory redirect)."""
+        try:
+            r = self.session.head(url, timeout=self.timeout, allow_redirects=False)
+            if r.status_code in (301, 302):
+                return False
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _download_file(self, url: str, local_path: str) -> bool:
+        try:
+            r = self.session.get(url, stream=True, timeout=self.timeout)
             if r.status_code == 200:
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                with open(local_path, 'wb') as f:
+                with open(local_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
                 return True
         except Exception as e:
-            if not self.quiet:
-                print(f"[ERROR] Failed to download {url}: {e}")
+            self._log(_c(COLOR_ERR, f"[ERROR] Download failed {url}: {e}", self.color))
         return False
 
-    def parse_dsstore(self, content):
-        """Parse .DS_Store content and return list of filenames"""
-        filenames = set()
-        try:
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp.write(content)
-                tmp.flush()
-                tmp_path = tmp.name
+    # -- core scanning --
 
-            d = DSStore.open(tmp_path, 'r+')
+    def _classify_entries(self, base_url: str, names: set[str]):
+        """Classify names into dirs (with/without .DS_Store) and files. Uses thread pool."""
+        dirs_with_ds: list[tuple[str, bytes]] = []
+        dirs_without_ds: list[str] = []
+        files: list[str] = []
 
-            # Extract filenames from .DS_Store
-            for entry in d:
-                filename = entry.filename
-                if filename and self.is_valid_name(filename):
-                    filenames.add(filename)
-
-            d.close()
-            os.unlink(tmp_path)
-        except Exception as e:
-            if not self.quiet:
-                print(f"[ERROR] Failed to parse .DS_Store: {e}")
-
-        return filenames
-
-    def check_if_directory(self, base_url, name):
-        """Check if an entry is a directory by looking for .DS_Store inside it"""
-        dsstore_url = urljoin(base_url + '/', name + '/.DS_Store')
-        has_dsstore = False
-        dsstore_content = None
-
-        try:
-            r = requests.get(dsstore_url, timeout=10, verify=False)
-            if r.status_code == 200:
-                has_dsstore = True
-                dsstore_content = r.content
-        except Exception:
-            pass
-
-        # Even if no .DS_Store, check if it's a directory by trying to access with trailing slash
-        is_directory = has_dsstore
-        if not has_dsstore:
-            # Check if accessing the name redirects (301/302) or if name/ is accessible
+        def probe(name: str):
+            entry_url = urljoin(base_url + "/", name)
+            ds_content = self._fetch_dsstore(entry_url)
+            if ds_content is not None:
+                return ("dir_ds", name, ds_content)
+            # Check redirect -> directory without .DS_Store
             try:
-                r = requests.head(urljoin(base_url + '/', name), timeout=10, allow_redirects=False, verify=False)
-                if r.status_code in [301, 302]:
-                    is_directory = True
+                r = self.session.head(entry_url, timeout=self.timeout, allow_redirects=False)
+                if r.status_code in (301, 302):
+                    return ("dir_nods", name, None)
             except Exception:
                 pass
+            # Check if file
+            if self._is_accessible_file(entry_url):
+                return ("file", name, None)
+            return (None, name, None)
 
-        return is_directory, dsstore_content
+        with ThreadPoolExecutor(max_workers=self.threads) as pool:
+            futures = {pool.submit(probe, n): n for n in sorted(names)}
+            for future in as_completed(futures):
+                kind, name, content = future.result()
+                if kind == "dir_ds":
+                    dirs_with_ds.append((name, content))
+                elif kind == "dir_nods":
+                    dirs_without_ds.append(name)
+                elif kind == "file":
+                    files.append(name)
 
-    def check_if_file(self, url):
-        """Check if an entry is an accessible file (not a directory)"""
-        try:
-            r = requests.head(url, timeout=10, allow_redirects=False, verify=False)
-            # If it redirects (301/302), it's probably a directory
-            if r.status_code in [301, 302]:
-                return False
-            if r.status_code == 200:
-                return True
-            # Some servers don't support HEAD, try GET
-            r = requests.get(url, timeout=10, stream=True, allow_redirects=False, verify=False)
-            # If it redirects, it's a directory
-            if r.status_code in [301, 302]:
-                return False
-            if r.status_code == 200:
-                return True
-        except Exception:
-            pass
-        return False
+        dirs_with_ds.sort(key=lambda x: x[0])
+        dirs_without_ds.sort()
+        files.sort()
 
-    def scan_directory_recursively(self, directory_name, parent_path, depth=0):
-        """Recursively scan a directory for .DS_Store files using depth-first search"""
-        # Build full URL and local path
-        if parent_path:
-            full_url = urljoin(self.url + '/', parent_path + '/' + directory_name)
-            local_path = os.path.join(self.download_dir, parent_path, directory_name)
-            relative_path = os.path.join(parent_path, directory_name)
-        else:
-            full_url = urljoin(self.url + '/', directory_name)
-            local_path = os.path.join(self.download_dir, directory_name)
-            relative_path = directory_name
+        return dirs_with_ds, dirs_without_ds, files
 
-        # Skip if already scanned
-        if relative_path in self.scanned_dirs:
+    def _scan_dir(self, rel_path: str, ds_content: bytes, depth: int) -> None:
+        """Recursively scan a directory given its .DS_Store content."""
+        if rel_path in self.scanned_dirs:
+            return
+        if self.max_depth > 0 and depth > self.max_depth:
             return
 
-        self.scanned_dirs.add(relative_path)
-
-        # Check if directory has .DS_Store
-        is_dir, dsstore_content = self.check_if_directory(self.url, relative_path)
-
-        if not is_dir or not dsstore_content:
-            # No .DS_Store to parse, can't enumerate contents
-            return
-
-        # Print directory (only once, when actually scanning it)
+        self.scanned_dirs.add(rel_path)
+        base_url = self.url if not rel_path else urljoin(self.url + "/", rel_path)
         indent = "  " * depth
-        print(f"{indent}[DIR] {relative_path}/")
-        self.found_dirs.append(relative_path)
 
-        if self.download:
-            os.makedirs(local_path, exist_ok=True)
+        display_path = rel_path + "/" if rel_path else "/"
+        self._log(f"{indent}{_c(COLOR_DIR, f'[DIR] {display_path}', self.color)}")
+        self.result.entries.append(Entry(path=display_path, is_dir=True, url=base_url + "/"))
 
-        # Parse .DS_Store to get entries
-        filenames = self.parse_dsstore(dsstore_content)
+        if self.download and rel_path:
+            os.makedirs(os.path.join(self.download_dir, rel_path), exist_ok=True)
 
-        # Separate files and directories for better ordering
-        files = []
-        directories = []
+        names = self._parse_dsstore(ds_content)
+        if not names:
+            return
 
-        for name in sorted(filenames):
-            entry_url = urljoin(full_url + '/', name)
-            entry_local_path = os.path.join(local_path, name)
-            entry_relative_path = os.path.join(relative_path, name)
+        dirs_with_ds, dirs_without_ds, files = self._classify_entries(base_url, names)
 
-            # Check if it's a directory first
-            is_subdir, subdir_dsstore = self.check_if_directory(full_url, name)
+        # Files
+        for name in files:
+            file_rel = f"{rel_path}/{name}" if rel_path else name
+            file_url = urljoin(base_url + "/", name)
+            entry = Entry(path=file_rel, is_dir=False, url=file_url)
 
-            if is_subdir:
-                # It's a directory
-                if subdir_dsstore:
-                    # Has .DS_Store, will scan it recursively
-                    directories.append((name, entry_relative_path, True))
-                else:
-                    # No .DS_Store, just list it
-                    directories.append((name, entry_relative_path, False))
-            else:
-                # Check if it's a file
-                if self.check_if_file(entry_url):
-                    files.append((name, entry_url, entry_local_path, entry_relative_path))
-
-        # Print and process files first
-        for name, entry_url, entry_local_path, entry_relative_path in files:
-            print(f"{indent}  [FILE] {entry_relative_path}")
-            self.found_files.append(entry_relative_path)
+            self._log(f"{indent}  {_c(COLOR_FILE, f'[FILE] {file_rel}', self.color)}")
 
             if self.download:
-                if self.download_file(entry_url, entry_local_path):
-                    print(f"{indent}  [DOWNLOAD] {entry_relative_path}")
+                local_path = os.path.join(self.download_dir, file_rel)
+                if self._download_file(file_url, local_path):
+                    entry.downloaded = True
+                    self._log(f"{indent}  {_c(COLOR_DL, f'[DOWNLOAD] {file_rel}', self.color)}")
 
-        # Then recursively process directories (depth-first)
-        for name, entry_relative_path, has_dsstore in directories:
-            if has_dsstore:
-                # Recursively scan this directory immediately (depth-first)
-                self.scan_directory_recursively(name, relative_path, depth + 1)
+            self.result.entries.append(entry)
+
+        # Dirs without .DS_Store
+        for name in dirs_without_ds:
+            dir_rel = f"{rel_path}/{name}" if rel_path else name
+            dir_url = urljoin(base_url + "/", name + "/")
+            self._log(f"{indent}  {_c(COLOR_DIR, f'[DIR] {dir_rel}/ (no .DS_Store)', self.color)}")
+            self.result.entries.append(Entry(path=dir_rel + "/", is_dir=True, url=dir_url))
+
+        # Recurse into dirs with .DS_Store
+        for name, content in dirs_with_ds:
+            dir_rel = f"{rel_path}/{name}" if rel_path else name
+            self._scan_dir(dir_rel, content, depth + 1)
+
+    def scan(self) -> ScanResult:
+        """Main entry point. Returns ScanResult."""
+        self._log(_c(COLOR_INFO, f"[INFO] Scanning {self.url}", self.color))
+        self._log(_c(COLOR_INFO, "[INFO] Fetching root .DS_Store...", self.color))
+
+        root_content = self._fetch_dsstore(self.url)
+        if root_content is None:
+            msg = f"[ERROR] No .DS_Store found at {self.url}/.DS_Store"
+            if self.json_output:
+                print(json.dumps({"error": msg}))
             else:
-                # Just list the directory without scanning
-                print(f"{indent}  [DIR] {entry_relative_path}/ (no .DS_Store)")
-                self.found_dirs.append(entry_relative_path)
+                print(_c(COLOR_ERR, msg, self.color))
+            sys.exit(1)
 
-    def scan_from_root(self, initial_response):
-        """Start scanning from root .DS_Store"""
+        self._log(_c(COLOR_INFO, "[INFO] Root .DS_Store found! Starting recursive scan...\n", self.color))
+
         if self.download:
             os.makedirs(self.download_dir, exist_ok=True)
-            if not self.quiet:
-                print(f"[INFO] Files will be downloaded to: {self.download_dir}/")
+            self._log(_c(COLOR_INFO, f"[INFO] Downloading to: {self.download_dir}/", self.color))
 
-        print(f"[DIR] /")
-        self.found_dirs.append("/")
+        self._scan_dir("", root_content, depth=0)
 
-        # Parse root .DS_Store
-        filenames = self.parse_dsstore(initial_response.content)
-
-        # Separate files and directories
-        files = []
-        directories = []
-
-        for name in sorted(filenames):
-            entry_url = urljoin(self.url + '/', name)
-            entry_local_path = os.path.join(self.download_dir, name)
-
-            # Check if it's a directory
-            is_dir, dir_dsstore = self.check_if_directory(self.url, name)
-
-            if is_dir:
-                if dir_dsstore:
-                    # Has .DS_Store, will scan recursively
-                    directories.append((name, True))
-                else:
-                    # No .DS_Store, just list it
-                    directories.append((name, False))
-            else:
-                # Check if it's a file
-                if self.check_if_file(entry_url):
-                    files.append((name, entry_url, entry_local_path))
-
-        # Print and process root-level files first
-        for name, entry_url, entry_local_path in files:
-            print(f"  [FILE] {name}")
-            self.found_files.append(name)
-
+        # Summary
+        if self.json_output:
+            print(json.dumps(self.result.to_dict(), indent=2))
+        else:
+            self._log(f"\n{'=' * 60}")
+            self._log("[SUMMARY]")
+            self._log(f"  Directories: {len(self.result.dirs)}")
+            self._log(f"  Files:       {len(self.result.files)}")
             if self.download:
-                if self.download_file(entry_url, entry_local_path):
-                    print(f"  [DOWNLOAD] {name}")
+                self._log(f"  Downloaded to: {self.download_dir}/")
+            self._log("=" * 60)
 
-        # Then recursively scan directories (depth-first)
-        for name, has_dsstore in directories:
-            if has_dsstore:
-                # Recursively scan immediately (depth-first)
-                self.scan_directory_recursively(name, '', depth=1)
-            else:
-                # Just list the directory
-                print(f"  [DIR] {name}/ (no .DS_Store)")
-                self.found_dirs.append(name)
+        return self.result
 
-    def scan(self):
-        """Main scanning function"""
-        if not self.quiet:
-            print(f"[INFO] Scanning {self.url}")
-            print(f"[INFO] Trying to access root .DS_Store...")
 
-        try:
-            r = requests.get(self.url + "/.DS_Store", timeout=10, verify=False)
-            if r.status_code != 200:
-                print(f"[ERROR] Failed to access .DS_Store (HTTP {r.status_code})")
-                print(f"[ERROR] URL: {r.url}")
-                sys.exit(1)
-
-            if not self.quiet:
-                print(f"[200] {r.url}")
-                print(f"[INFO] Root .DS_Store found! Starting recursive scan...\n")
-
-            self.scan_from_root(r)
-
-            if not self.quiet:
-                print(f"\n{'=' * 60}")
-                print(f"[SUMMARY]")
-                print(f"  Directories found: {len(self.found_dirs)}")
-                print(f"  Files found: {len(self.found_files)}")
-                if self.download:
-                    print(f"  Downloaded to: {self.download_dir}/")
-                print(f"{'=' * 60}")
-
-        except requests.exceptions.RequestException as e:
-            print(f"[ERROR] Network error: {e}")
-            sys.exit(1)
-        except Exception as e:
-            print(f"[ERROR] Unexpected error: {e}")
-            sys.exit(1)
-
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description=rf"  dsstore-tree is a tool to discover files and directories through .DS_Store exposure.",
-        formatter_class=RawTextHelpFormatter
+        description="  dsstore-tree — discover files and directories via exposed .DS_Store files.",
+        formatter_class=argparse.RawTextHelpFormatter,
     )
-
-    parser.add_argument('-u', '--url', help='Base URL to scan (e.g., https://example.com)', required=True)
-    parser.add_argument('-d', '--download', help='Download and mirror discovered files and directories',
-                        action="store_true")
-    parser.add_argument('-q', '--quiet', help="Supress output where possible", action="store_true")
+    parser.add_argument("-u", "--url", required=True, help="Base URL to scan (e.g., https://example.com)")
+    parser.add_argument("-d", "--download", action="store_true", help="Download and mirror discovered files")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress informational output")
+    parser.add_argument("-j", "--json", action="store_true", dest="json_output", help="Output results as JSON")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    parser.add_argument("--depth", type=int, default=0, metavar="N", help="Max recursion depth (0 = unlimited)")
+    parser.add_argument("--timeout", type=int, default=10, metavar="SEC", help="HTTP timeout in seconds (default: 10)")
+    parser.add_argument("--threads", type=int, default=10, metavar="N", help="Concurrent requests (default: 10)")
+    parser.add_argument("--proxy", type=str, default=None, metavar="URL", help="HTTP/SOCKS proxy (e.g., http://127.0.0.1:8080)")
+    parser.add_argument("-H", "--header", action="append", default=[], metavar="K:V", help="Custom header (repeatable)")
+    parser.add_argument("-o", "--output", type=str, default=None, metavar="FILE", help="Write JSON results to file")
 
     args = parser.parse_args()
 
-    if len(sys.argv) == 1:
-        parser.print_help()
-        sys.exit(1)
-
-    if not args.quiet:
+    use_color = sys.stdout.isatty() and not args.no_color and not args.json_output
+    if not args.quiet and not args.json_output:
         print(BANNER)
 
-    # Suppress SSL warnings when verify=False
-    import urllib3
+    headers: dict[str, str] = {}
+    for h in args.header:
+        if ":" in h:
+            k, v = h.split(":", 1)
+            headers[k.strip()] = v.strip()
 
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    scanner = Scanner(
+        args.url,
+        download=args.download,
+        quiet=args.quiet,
+        color=use_color,
+        max_depth=args.depth,
+        timeout=args.timeout,
+        threads=args.threads,
+        proxy=args.proxy,
+        headers=headers or None,
+        json_output=args.json_output,
+    )
 
-    s = Scanner(args.url, args.download, args.quiet)
-    s.scan()
+    result = scanner.scan()
+
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump(result.to_dict(), f, indent=2)
+        if not args.quiet:
+            print(f"[INFO] Results written to {args.output}")
+
 
 if __name__ == "__main__":
     main()

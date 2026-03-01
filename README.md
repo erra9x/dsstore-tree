@@ -1,61 +1,91 @@
 # dsstore-tree
 
-`dsstore-tree` is a tool to recursively discover files and directories on web servers by parsing exposed `.DS_Store` files (macOS metadata files).
-
-# Features
+Recursively discover files and directories on web servers by parsing exposed `.DS_Store` files.
 
 ![dsstore-tree](static/dsstore-tree-demo.png)
 
-- **Recursive Discovery**: Automatically finds and scans nested `.DS_Store` files
-- **Directory Structure Mapping**: Builds complete directory tree from discovered files
-- **Download & Mirror**: Option to download all discovered files with original directory structure
+## Features
 
-# Usage
+- **Recursive discovery** — follows nested `.DS_Store` files to map full directory trees
+- **Concurrent scanning** — parallel HTTP requests for fast enumeration
+- **Download & mirror** — optionally download all discovered files preserving directory structure
+- **JSON output** — machine-readable results for integration with other tools
+- **Proxy support** — route through HTTP/SOCKS proxies (e.g., Burp Suite)
+- **Custom headers** — add cookies, auth tokens, or any HTTP headers
+- **Depth limiting** — control recursion depth
+- **Colored output** — visual distinction between files, directories, and status messages
 
-```shell
-python3 dsstore-tree.py -h
-```
+## Installation
 
-```yaml
-usage: dsstore-tree.py [-h] -u URL [-d] [-q]
-
-  dsstore-tree is a tool to discover files and directories through .DS_Store exposure.
-
-optional arguments:
-  -h, --help         show this help message and exit
-  -u URL, --url URL  Base URL to scan (e.g., https://example.com)
-  -d, --download     Download and mirror discovered files and directories
-  -q, --quiet        Supress output where possible
-```
-
-# Installation
-
-Install via `pipx`:
+Install via `pipx` (recommended):
 
 ```
 pipx install git+https://github.com/vflame6/dsstore-tree.git
 ```
 
-Manual installation:
+Or manually:
 
-```shell
+```
 git clone https://github.com/vflame6/dsstore-tree.git
 cd dsstore-tree
 pip3 install -r requirements.txt
 ```
 
-# About .DS_Store information disclosure issue
+## Usage
 
-A .DS_Store (Desktop Services Store) file is a hidden file created by the macOS operating system. It is used by Finder to store custom attributes of a folder, such as the positions of icons, the choice of background image, and other view options. Each directory in macOS can have its own .DS_Store file.
+```
+dsstore-tree -u https://example.com
+```
 
-These files contain:
+### Options
 
-- Filenames in the directory
-- View settings and metadata
-- Information about files that may not be linked elsewhere
+```
+-u, --url URL       Base URL to scan (required)
+-d, --download      Download and mirror discovered files
+-q, --quiet         Suppress informational output
+-j, --json          Output results as JSON
+-o, --output FILE   Write JSON results to file
+-H, --header K:V    Custom header (repeatable)
+--proxy URL         HTTP/SOCKS proxy (e.g., http://127.0.0.1:8080)
+--threads N         Concurrent requests (default: 10)
+--timeout SEC       HTTP timeout in seconds (default: 10)
+--depth N           Max recursion depth (0 = unlimited)
+--no-color          Disable colored output
+```
 
-For more information see following links:
+### Examples
 
-- https://wh1c4t.medium.com/extract-file-from-ds-store-815a22542da9
-- https://www.invicti.com/web-vulnerability-scanner/vulnerabilities/dsstore-file-found/
-- https://xelkomy.medium.com/how-i-was-able-to-get-1000-bounty-from-a-ds-store-file-dc2b7175e92c
+Basic scan:
+```
+dsstore-tree -u https://target.com
+```
+
+Scan through Burp Suite proxy:
+```
+dsstore-tree -u https://target.com --proxy http://127.0.0.1:8080
+```
+
+Download all files and save JSON report:
+```
+dsstore-tree -u https://target.com -d -o report.json
+```
+
+With authentication:
+```
+dsstore-tree -u https://target.com -H "Cookie: session=abc123"
+```
+
+JSON output for piping:
+```
+dsstore-tree -u https://target.com -j | jq '.files[].path'
+```
+
+## About .DS_Store
+
+`.DS_Store` (Desktop Services Store) is a hidden file created by macOS Finder to store folder display preferences (icon positions, view options, etc.). When deployed to web servers accidentally, these files leak the names of files and directories — even those not linked or indexed anywhere.
+
+This is a known information disclosure vulnerability. dsstore-tree automates the exploitation by recursively parsing these files to reconstruct the full directory tree of a web application.
+
+## License
+
+MIT
